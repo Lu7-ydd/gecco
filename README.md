@@ -1,26 +1,56 @@
-# GeCCo Module Tree
+# GeCCo
 
-基于 `code.md` 的五阶段算法实现：
-- 阶段1：基因特异性二值化 + `phi/Fisher/BH` + 有效基因过滤
-- 阶段2：根节点与核心初始模块构建
-- 阶段3：P/N/M 软分类 + R1-R4 插入与约束回滚
-- 阶段4：后处理剪枝、单子节点压缩、深度压缩、弱拮抗合并
-- 阶段5：模块树输出、细胞 major/subtype 赋值与可视化
+**Gene-First Identity Construction for Robust Cell Identification in Single-Cell Transcriptomics**
 
-## 运行
+GeCCo is a gene-first hierarchical modeling framework for single-cell transcriptomics.  
+It builds a gene-module tree from Boolean gene-gene coupling, then assigns cell identities on top of that hierarchy to improve global-local consistency. 
 
-```bash
-PYTHONPATH=src python scripts/run_pipeline.py --input datasets/adata_672.h5ad --output outputs/run
-```
+## Core Idea
 
-## 数据集验证
+1. Binarize expression profiles and compute `phi` correlation with Fisher test + BH correction.
+2. Filter valid genes and build a hierarchical module tree using incremental insertion rules (R1-R4).
+3. Assign cells into `depth1/depth2/...` labels based on module-level scores.
+4. Output module structure, insertion trace, cell assignments, and visualizations.
 
-```bash
-PYTHONPATH=src python scripts/validate_dataset.py
-```
-
-## 测试
+## Installation
 
 ```bash
-PYTHONPATH=src pytest
+cd GeCCo
+pip install -e .
 ```
+
+## Quick Start
+
+```python
+import anndata as ad
+from gecco import GeCCoConfig, GeCCoPipeline
+from gecco.visualize import plot_module_tree, plot_node_genes
+
+adata = ad.read_h5ad("datasets/adata_sim.h5ad")
+
+config = GeCCoConfig(
+    phi_threshold=0.3,
+    fdr_threshold=0.05,
+    max_depth=5,
+)
+result = GeCCoPipeline(config).run(adata)
+
+print(result.metrics)
+print(result.cell_assignments.head())
+
+plot_module_tree(result.tree_root, "outputs/module_tree.png")
+plot_node_genes(result.tree_root, "outputs/node_genes.png")
+```
+
+## Repository Structure
+
+- `src/gecco/`: Core implementation (`preprocess`, `tree`, `pipeline`, `visualize`)
+- `datasets/`: Example input data
+- `outputs/`: Example figures
+- `notebooks/`: Reproducible analysis and visualization notebooks
+
+
+## Paper
+
+`Gene-First Identity Construction for Robust Cell Identification in Single-Cell Transcriptomics`  
+(Luqi Yang, Zhenwei Huang, Jinpu Cai, Hongyi Xin)
