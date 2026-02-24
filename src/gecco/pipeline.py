@@ -205,8 +205,13 @@ class GeCCoPipeline:
                     if isinstance(_n_depth2, int)
                     else list(_n_depth2)
                 )
-                # Track highest node ID used so far to avoid collisions
-                id_offset = len(pp_root.children)  # M1..Mn already used
+                # Track highest node ID used so far to avoid collisions.
+                # Scan the actual tree to find the max numeric ID already assigned.
+                def _max_id_used(node: ModuleNode) -> int:
+                    num = int(node.node_id[1:]) if node.node_id.startswith("M") and node.node_id[1:].isdigit() else 0
+                    return max(num, *(_max_id_used(c) for c in node.children)) if node.children else num
+
+                id_offset = _max_id_used(pp_root)
                 for d1_node, k2 in zip(pp_root.children, n_depth2_list):
                     cell_mask = depth1_labels == d1_node.node_id
                     if cell_mask.sum() == 0 or k2 <= 1:
