@@ -1,5 +1,3 @@
-<div align="center">
-
 # GeCCo
 
 **GeCCo (Gene Co-expression Constructed Identity)** is a gene-first framework for constructing interpretable cell identities from single-cell transcriptomic data. It organizes co-expression and mutual exclusion into a hierarchy of gene programs, connecting broad lineages to their finer subtypes. Its central premise is that a credible cell identity rests on genes that support both the proposed grouping and one another. This makes the molecular basis of each distinction explicit, linking the structure of cell identities to the evidence that supports them.
