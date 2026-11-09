@@ -6,6 +6,44 @@ from collections import defaultdict
 import pandas as pd
 
 from .tree import ModuleNode
+
+
+def module_table(root: ModuleNode) -> pd.DataFrame:
+    """One row per node; direct markers and complete subtree markers stay distinct."""
+    rows = []
+    for node, depth, path in _iter_nodes_with_depth_and_path(root):
+        rows.append({
+            "node_id": node.node_id,
+            "parent_id": path[-2] if depth else None,
+            "depth": depth,
+            "direct_genes": sorted(node.genes),
+            "total_genes": sorted(node.total_genes()),
+            "n_direct": len(node.genes),
+            "n_total": len(node.total_genes()),
+            "path": "->".join(path),
+        })
+    return pd.DataFrame(rows)
+
+
+def select_module_genes(
+    root: ModuleNode, node_ids: list[str] | None = None, *, gene_source: str = "total"
+) -> list[str]:
+    """Select modules' genes in tree order, retaining each gene only once."""
+    if gene_source not in {"direct", "total"}:
+        raise ValueError("gene_source must be 'direct' or 'total'")
+    nodes = list(_iter_nodes_with_depth_and_path(root))
+    selected = set(node_ids) if node_ids is not None else {node.node_id for node, _, _ in nodes}
+    unknown = selected - {node.node_id for node, _, _ in nodes}
+    if unknown:
+        raise ValueError(f"Unknown module IDs: {sorted(unknown)}")
+    genes = []
+    for node, _, path in nodes:
+        include = node.node_id in selected if gene_source == "direct" else bool(selected.intersection(path))
+        if include:
+            genes.extend(sorted(node.genes))
+    return list(dict.fromkeys(genes))
+
+
 def add_depth_labels_to_obs(adata, result, *, include_true=False):
     """
     把 result.cell_assignments 里的层级标签写入 adata.obs。
@@ -21,6 +59,8 @@ def add_depth_labels_to_obs(adata, result, *, include_true=False):
     if not depth_cols:
         raise ValueError("result.cell_assignments 里没有 depth 列")
 
+    old_depth_cols = [c for c in adata.obs if re.match(r"^depth\d+$", str(c))]
+    adata.obs.drop(columns=old_depth_cols, inplace=True)
     adata.obs[depth_cols] = ca[depth_cols].astype("object")
 
     if include_true:
@@ -33,7 +73,7 @@ int(x[10:]))
 
 
 def _iter_nodes_with_depth_and_path(root: ModuleNode):
-    stack: list[tuple[ModuleNode, int, list[str]]] = [(root, 0, ["root"])]
+    stack: list[tuple[ModuleNode, int, list[str]]] = [(root, 0, [root.node_id])]
     while stack:
         node, depth, path = stack.pop()
         yield node, depth, path

@@ -1,14 +1,20 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from collections.abc import Sequence
 
 import anndata as ad
 import numpy as np
+import pandas as pd
 from scipy import sparse
-from scipy.stats import fisher_exact
-from statsmodels.stats.multitest import fdrcorrection
 
 from .config import GeCCoConfig
+from .relationships import (
+    binarize_expression,
+    binary_correlation,
+    binary_fdr,
+    compute_relationship_matrix,
+)
 
 
 @dataclass(slots=True)
@@ -16,13 +22,19 @@ class PreprocessResult:
     gene_names: np.ndarray
     binary_expr: np.ndarray
     phi: np.ndarray
-    fdr: np.ndarray
+    fdr: np.ndarray | None
     valid_gene_mask: np.ndarray
     connectivity: np.ndarray
+    cell_names: np.ndarray | None = None
 
     @property
     def valid_gene_names(self) -> np.ndarray:
         return self.gene_names[self.valid_gene_mask]
+
+    @property
+    def relationship_matrix(self) -> np.ndarray:
+        """``phi`` is retained as a compatibility name for any relationship method."""
+        return self.phi
 
 
 class DataPreprocessor:
@@ -32,78 +44,65 @@ class DataPreprocessor:
     @staticmethod
     def _to_dense(adata: ad.AnnData) -> np.ndarray:
         x = adata.X
-        if sparse.issparse(x):
-            return x.toarray()
-        return np.asarray(x)
+        return x.toarray() if sparse.issparse(x) else np.asarray(x)
 
     def binarize(self, adata: ad.AnnData) -> np.ndarray:
-        x = self._to_dense(adata)
-        thresholds = np.quantile(x, self.config.binarize_quantile, axis=0)
-        return (x > thresholds).astype(np.int8)
+        return binarize_expression(self._to_dense(adata), self.config.binarize_quantile)
+
+    # Preserve the original callable helpers used in existing notebooks.
+    compute_phi = staticmethod(binary_correlation)
+    compute_fdr = staticmethod(binary_fdr)
+
+    def filter_valid_genes(self, phi: np.ndarray, fdr: np.ndarray | None) -> tuple[np.ndarray, np.ndarray]:
+        related = (np.abs(phi) >= self.config.phi_threshold) & (phi != 0)
+        if self.config.test:
+            if fdr is None:
+                raise ValueError("test=True requires an FDR matrix")
+            related &= fdr <= self.config.fdr_threshold
+        np.fill_diagonal(related, False)
+        # Isolated selected genes remain visible to the builder and its trace.
+        return np.ones(phi.shape[0], dtype=bool), related.sum(axis=1)
 
     @staticmethod
-    def compute_phi(binary_expr: np.ndarray) -> np.ndarray:
-        n_cells, _ = binary_expr.shape
-        x = binary_expr.astype(np.int64)
+    def _align_matrix(matrix: pd.DataFrame | np.ndarray, genes: np.ndarray, label: str) -> np.ndarray:
+        if isinstance(matrix, pd.DataFrame):
+            if not matrix.index.is_unique or not matrix.columns.is_unique:
+                raise ValueError(f"{label} gene labels must be unique")
+            matrix = matrix.loc[genes, genes].to_numpy()
+        values = np.array(matrix, dtype=np.float64, copy=True)
+        if values.shape != (len(genes), len(genes)):
+            raise ValueError(f"{label} shape must match the selected genes")
+        if not np.isfinite(values).all() or not np.allclose(values, values.T):
+            raise ValueError(f"{label} must be finite and symmetric")
+        np.fill_diagonal(values, 0.0)
+        return values
 
-        n11 = x.T @ x
-        n1 = x.sum(axis=0)
+    def run(
+        self,
+        adata: ad.AnnData,
+        genes: Sequence[str] | None = None,
+        relationship_matrix: pd.DataFrame | np.ndarray | None = None,
+        fdr_matrix: pd.DataFrame | np.ndarray | None = None,
+    ) -> PreprocessResult:
+        gene_names = adata.var_names.to_numpy(copy=True) if genes is None else np.asarray(list(genes))
+        if not len(gene_names) or len(set(gene_names)) != len(gene_names):
+            raise ValueError("Select at least one gene, with no duplicate names")
+        x = self._to_dense(adata[:, gene_names])
+        binary = binarize_expression(x, self.config.binarize_quantile)
 
-        n10 = n1[:, None] - n11
-        n01 = n1[None, :] - n11
-        n00 = n_cells - n11 - n10 - n01
+        if relationship_matrix is None:
+            if fdr_matrix is not None:
+                raise ValueError("fdr_matrix is only used with a custom relationship_matrix")
+            phi, fdr = compute_relationship_matrix(
+                x, self.config.relationship_method, self.config.test, self.config.binarize_quantile
+            )
+        else:
+            phi = self._align_matrix(relationship_matrix, gene_names, "relationship_matrix")
+            if self.config.test and fdr_matrix is None:
+                raise ValueError("A custom relationship_matrix with test=True requires fdr_matrix")
+            fdr = self._align_matrix(fdr_matrix, gene_names, "fdr_matrix") if self.config.test else None
+            if fdr is not None and np.any((fdr < 0) | (fdr > 1)):
+                raise ValueError("fdr_matrix values must be between 0 and 1")
 
-        numerator = n11 * n00 - n10 * n01
-        denom = np.sqrt((n11 + n10) * (n01 + n00) * (n11 + n01) * (n10 + n00))
-
-        phi = np.zeros_like(numerator, dtype=np.float64)
-        mask = denom > 0
-        phi[mask] = numerator[mask] / denom[mask]
-        np.fill_diagonal(phi, 0.0)
-        return phi
-
-    @staticmethod
-    def compute_fdr(binary_expr: np.ndarray) -> np.ndarray:
-        _, n_genes = binary_expr.shape
-        x = binary_expr.astype(np.int8)
-        iu = np.triu_indices(n_genes, 1)
-
-        pvals = np.ones(len(iu[0]), dtype=np.float64)
-        for idx, (i, j) in enumerate(zip(iu[0], iu[1], strict=False)):
-            g1 = x[:, i]
-            g2 = x[:, j]
-            a = int(np.sum((g1 == 1) & (g2 == 1)))
-            b = int(np.sum((g1 == 1) & (g2 == 0)))
-            c = int(np.sum((g1 == 0) & (g2 == 1)))
-            d = int(np.sum((g1 == 0) & (g2 == 0)))
-            _, p = fisher_exact([[a, b], [c, d]], alternative="two-sided")
-            pvals[idx] = p
-
-        _, qvals = fdrcorrection(pvals, alpha=0.05, method="indep")
-
-        fdr = np.ones((n_genes, n_genes), dtype=np.float64)
-        fdr[iu] = qvals
-        fdr[(iu[1], iu[0])] = qvals
-        np.fill_diagonal(fdr, 0.0)
-        return fdr
-
-    def filter_valid_genes(self, phi: np.ndarray, fdr: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
-        sig = (np.abs(phi) >= self.config.phi_threshold) & (fdr <= self.config.fdr_threshold)
-        np.fill_diagonal(sig, False)
-        connectivity = sig.sum(axis=1)
-        valid = connectivity >= 1
-        return valid, connectivity
-
-    def run(self, adata: ad.AnnData) -> PreprocessResult:
-        binary = self.binarize(adata)
-        phi = self.compute_phi(binary)
-        fdr = self.compute_fdr(binary)
         valid_mask, connectivity = self.filter_valid_genes(phi, fdr)
-        return PreprocessResult(
-            gene_names=adata.var_names.to_numpy(copy=True),
-            binary_expr=binary,
-            phi=phi,
-            fdr=fdr,
-            valid_gene_mask=valid_mask,
-            connectivity=connectivity,
-        )
+        return PreprocessResult(gene_names, binary, phi, fdr, valid_mask, connectivity, adata.obs_names.to_numpy(copy=True))

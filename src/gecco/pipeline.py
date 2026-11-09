@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from collections.abc import Sequence
 
 import anndata as ad
 import numpy as np
@@ -11,6 +12,7 @@ from sklearn.metrics import adjusted_rand_score
 from .config import GeCCoConfig
 from .preprocess import DataPreprocessor, PreprocessResult
 from .tree import ModuleNode, ModuleTreeBuilder, post_process
+from .utils import module_table
 
 
 @dataclass(slots=True)
@@ -24,6 +26,10 @@ class PipelineResult:
     inserted_genes: list[str]
     noise_genes: list[str]
 
+    @property
+    def module_table(self) -> pd.DataFrame:
+        return module_table(self.tree_root)
+
 
 class GeCCoPipeline:
     def __init__(self, config: GeCCoConfig | None = None):
@@ -31,10 +37,7 @@ class GeCCoPipeline:
 
     @staticmethod
     def _to_dense(adata: ad.AnnData) -> np.ndarray:
-        x = adata.X
-        if sparse.issparse(x):
-            return x.toarray()
-        return np.asarray(x)
+        return adata.X.toarray() if sparse.issparse(adata.X) else np.asarray(adata.X)
 
     @staticmethod
     def _zscore(x: np.ndarray) -> np.ndarray:
@@ -43,236 +46,116 @@ class GeCCoPipeline:
         std[std == 0] = 1.0
         return (x - mean) / std
 
-    def _module_score(self, x_z: np.ndarray, genes: set[str], gene_to_idx: dict[str, int]) -> np.ndarray:
-        idx = [gene_to_idx[g] for g in genes if g in gene_to_idx]
-        if not idx:
-            return np.zeros(x_z.shape[0], dtype=np.float64)
-        return np.asarray(x_z[:, idx].mean(axis=1)).ravel()
+    def _module_score(self, x_z, genes, gene_to_idx):
+        idx = [gene_to_idx[g] for g in sorted(genes)]
+        return x_z[:, idx].mean(axis=1) if idx else np.zeros(x_z.shape[0])
 
-    def _collect_module_scores(self, x_z: np.ndarray, root: ModuleNode, gene_to_idx: dict[str, int]) -> pd.DataFrame:
-        rows: dict[str, np.ndarray] = {}
+    def _collect_module_scores(self, x_z, root, gene_to_idx) -> pd.DataFrame:
+        rows = {}
         stack = [root]
         while stack:
             node = stack.pop()
             if node.node_id != "root":
-                rows[node.node_id] = self._module_score(x_z, node.total_genes(), gene_to_idx)
+                rows[node.node_id] = self._module_score(x_z, node.genes or node.total_genes(), gene_to_idx)
             stack.extend(reversed(node.children))
-        return pd.DataFrame(rows)
+        return pd.DataFrame(rows, index=np.arange(x_z.shape[0]))
 
-    def _assign_cells(
-        self,
-        x: np.ndarray,
-        root: ModuleNode,
-        gene_to_idx: dict[str, int],
-        max_depth: int | None = None,  # override; falls back to config if None
-    ) -> dict[str, np.ndarray]:
-
+    def _assign_cells(self, x, root, gene_to_idx, max_depth=None):
+        """Keep the original within-parent z scoring, using each node's direct markers."""
         n_cells = x.shape[0]
-        depth_cols: dict[str, np.ndarray] = {}
-        if max_depth is None:
-            max_depth = getattr(self.config, "pp_max_assign_depth", None)
-
-        # current_labels[i] = label for cell i at the current depth layer
-        # current_map: label → ModuleNode for the next expansion step
+        depth_cols = {}
         current_labels = np.full(n_cells, "root", dtype=object)
-        current_map: dict[str, ModuleNode] = {"root": root}
+        current_map = {"root": root}
         depth = 1
-
-        while current_map:
-            if max_depth is not None and depth > max_depth:
-                break
-            next_labels = np.full(n_cells, "NA", dtype=object)
-            next_map: dict[str, ModuleNode] = {}
-            assigned_any = False
-
+        while current_map and (max_depth is None or depth <= max_depth):
+            # Cells that reached a leaf retain it while other branches expand.
+            next_labels = current_labels.copy()
+            next_map = {}
             for parent_label, parent_node in current_map.items():
                 mask = current_labels == parent_label
-                n_in = int(mask.sum())
-                if n_in == 0 or not parent_node.children:
-                    # leaf or empty: propagate label unchanged (no new depth col)
+                if not np.any(mask) or not parent_node.children:
                     continue
-
-                children = sorted(
-                    parent_node.children,
-                    key=lambda n: len(n.total_genes()),
-                    reverse=True,
-                )
-
-                if len(children) == 1:
-                    child = children[0]
-                    next_labels[mask] = child.node_id
-                    next_map[child.node_id] = child
-                    assigned_any = True
-                    continue
-
-                # Z-score within this parent's cells (raw counts → one zscore per group)
-                # so that sub-module signals are not dominated by cross-group variance.
+                children = parent_node.children
                 x_sub_z = self._zscore(x[mask])
-
-                score_mat = np.column_stack(
-                    [self._module_score(x_sub_z, n.total_genes(), gene_to_idx) for n in children]
-                )
+                score_mat = np.column_stack([
+                    self._module_score(x_sub_z, n.genes or n.total_genes(), gene_to_idx)
+                    for n in children
+                ])
                 best = np.argmax(score_mat, axis=1)
-
-                masked_indices = np.where(mask)[0]
+                indices = np.flatnonzero(mask)
                 for i, child in enumerate(children):
                     sel = best == i
-                    if not np.any(sel):
-                        continue
-                    next_labels[masked_indices[sel]] = child.node_id
-                    next_map[child.node_id] = child
-                    assigned_any = True
-
-            if not assigned_any:
+                    if np.any(sel):
+                        next_labels[indices[sel]] = child.node_id
+                        next_map[child.node_id] = child
+            if not next_map:
                 break
-
             depth_cols[f"depth{depth}"] = next_labels.copy()
-            current_labels = next_labels
-            current_map = next_map
+            current_labels, current_map = next_labels, next_map
             depth += 1
-
         return depth_cols
 
-    @staticmethod
-    def _infer_truth(adata: ad.AnnData) -> tuple[np.ndarray | None, np.ndarray | None]:
-        if "cell_type" not in adata.obs:
-            return None, None
-        truth_sub = adata.obs["cell_type"].astype(str).to_numpy()
-        truth_major = np.array([v[0] if v else "NA" for v in truth_sub], dtype=object)
-        return truth_major, truth_sub
-
-    def run(self, adata: ad.AnnData, pre: PreprocessResult | None = None) -> PipelineResult:
+    def run(
+        self, adata: ad.AnnData, pre: PreprocessResult | None = None, *,
+        genes: Sequence[str] | None = None,
+        relationship_matrix: pd.DataFrame | np.ndarray | None = None,
+        fdr_matrix: pd.DataFrame | np.ndarray | None = None,
+        major_key: str | None = None, subtype_key: str | None = None,
+    ) -> PipelineResult:
         if pre is None:
-            pre = DataPreprocessor(self.config).run(adata)
+            pre = DataPreprocessor(self.config).run(adata, genes, relationship_matrix, fdr_matrix)
+        elif genes is not None or relationship_matrix is not None or fdr_matrix is not None:
+            raise ValueError("Supply either pre or genes/relationship_matrix/fdr_matrix")
+        if self.config.test and pre.fdr is None:
+            raise ValueError("test=True requires preprocessing with statistical tests enabled")
+        if pre.cell_names is not None and not np.array_equal(pre.cell_names, adata.obs_names):
+            raise ValueError("pre and adata must have the same cells in the same order")
 
-        n_expressed = pre.binary_expr.sum(axis=0).astype(np.int64)
         builder = ModuleTreeBuilder(
-            config=self.config,
-            gene_names=pre.gene_names,
-            phi=pre.phi,
-            fdr=pre.fdr,
-            connectivity=pre.connectivity,
-            valid_mask=pre.valid_gene_mask,
-            n_expressed=n_expressed,
+            config=self.config, gene_names=pre.gene_names, phi=pre.phi, fdr=pre.fdr,
+            connectivity=pre.connectivity, valid_mask=pre.valid_gene_mask,
+            n_expressed=pre.binary_expr.sum(axis=0),
         )
         tree_res = builder.build()
+        root = tree_res.root
+        trace = pd.DataFrame(tree_res.insertion_trace, columns=[
+            "step", "gene", "gene_index", "connectivity", "rule", "target_node_id",
+            "path", "accepted", "is_noise", "changed_nodes", "split_parent_id",
+            "split_child_ids", "reassigned_existing_genes",
+        ])
 
-        pp_enabled = getattr(self.config, "pp_enabled", False)
-        x = self._to_dense(adata)
-        x_z = self._zscore(x)
+        if self.config.pp_enabled:
+            valid = pre.valid_gene_mask
+            root = post_process(
+                phi=pre.phi[np.ix_(valid, valid)], gene_names=pre.gene_names[valid],
+                n_depth1=self.config.pp_n_depth1, n_depth2=self.config.pp_n_depth2,
+                branching=self.config.pp_branching, phi_threshold=self.config.phi_threshold,
+                pos_pair_frac=self.config.pp_pos_pair_frac,
+            )
+        final_genes = root.total_genes()
+        inserted = [g for g in pre.gene_names if g in final_genes]
+        noise = [g for g in pre.gene_names if g not in final_genes]
+        trace["in_final_tree"] = trace["gene"].isin(final_genes)
+        # Trace node IDs describe the incremental tree; post mode rebuilds the topology.
+        trace["stage"] = "incremental"
+
+        selected_adata = adata[:, pre.gene_names]
+        x = self._to_dense(selected_adata)
         gene_to_idx = {g: i for i, g in enumerate(pre.gene_names)}
-
-        if pp_enabled:
-            valid_mask = pre.valid_gene_mask
-            valid_names = list(pre.gene_names[valid_mask])
-            valid_phi = pre.phi[np.ix_(valid_mask, valid_mask)]
-            _max_assign_depth = getattr(self.config, "pp_max_assign_depth", None)
-            _pp_kwargs = dict(
-                phi_threshold=self.config.phi_threshold,
-                pos_pair_frac=getattr(self.config, "pp_pos_pair_frac", 0.80),
-                enabled=True,
-            )
-
-            # Stage 1: depth-1 only (n_depth2=0 → no second split)
-            pp_root = post_process(
-                phi=valid_phi,
-                gene_names=valid_names,
-                n_depth1=getattr(self.config, "pp_n_depth1", 3),
-                n_depth2=getattr(self.config, "pp_n_depth1", 3),
-                **_pp_kwargs,
-            )
-            tree_res = tree_res.__class__(
-                root=pp_root,
-                inserted_genes=tree_res.inserted_genes,
-                noise_genes=tree_res.noise_genes,
-                insertion_trace=tree_res.insertion_trace,
-            )
-
-            # Assign cells to depth-1 groups using global phi modules
-            depth1_assignments = self._assign_cells(
-                x, pp_root, gene_to_idx, max_depth=1
-            )
-            depth1_labels = depth1_assignments.get(
-                "depth1", np.full(x.shape[0], "NA", dtype=object)
-            )
-
-            # Stage 2: for each depth-1 node, recompute phi on its cell subset
-            # and build local depth-2 modules — unless max_assign_depth < 2
-            if _max_assign_depth is None or _max_assign_depth >= 2:
-                _n_depth2 = getattr(self.config, "pp_n_depth2", 3)
-                n_depth2_list = (
-                    [_n_depth2] * len(pp_root.children)
-                    if isinstance(_n_depth2, int)
-                    else list(_n_depth2)
-                )
-                # Track highest node ID used so far to avoid collisions.
-                # Scan the actual tree to find the max numeric ID already assigned.
-                def _max_id_used(node: ModuleNode) -> int:
-                    num = int(node.node_id[1:]) if node.node_id.startswith("M") and node.node_id[1:].isdigit() else 0
-                    return max(num, *(_max_id_used(c) for c in node.children)) if node.children else num
-
-                id_offset = _max_id_used(pp_root)
-                for d1_node, k2 in zip(pp_root.children, n_depth2_list):
-                    cell_mask = depth1_labels == d1_node.node_id
-                    if cell_mask.sum() == 0 or k2 <= 1:
-                        continue
-                    # Recompute phi on this cell subset
-                    local_binary = pre.binary_expr[cell_mask]
-                    local_phi = DataPreprocessor.compute_phi(local_binary)
-                    # Use same valid genes as global (keep gene space consistent)
-                    local_sub_root = post_process(
-                        phi=local_phi[np.ix_(valid_mask, valid_mask)],
-                        gene_names=valid_names,
-                        n_depth1=k2,
-                        n_depth2=0,
-                        id_offset=id_offset,
-                        **_pp_kwargs,
-                    )
-                    if local_sub_root is not None:
-                        # Attach local sub-tree's children directly under d1_node
-                        d1_node.children = local_sub_root.children
-                        id_offset += k2  # advance offset by number of new nodes
-
-        else:
-            # pp disabled: use the incremental tree as-is
-            pass
-
-        module_scores = self._collect_module_scores(x_z, tree_res.root, gene_to_idx)
-        cell_dict = self._assign_cells(x, tree_res.root, gene_to_idx)
-
-        truth_major, truth_sub = self._infer_truth(adata)
-
-        pred_major = cell_dict.get("depth1", np.full(x_z.shape[0], "NA", dtype=object))
-        pred_sub   = cell_dict.get("depth2", np.full(x_z.shape[0], "NA", dtype=object))
-
-        metrics: dict[str, float] = {
-            "n_valid_genes": float(pre.valid_gene_mask.sum()),
-            "n_inserted_genes": float(len(tree_res.inserted_genes)),
-            "n_noise_genes": float(len(tree_res.noise_genes)),
-            "n_major_pred": float(pd.Series(pred_major).nunique()),
-        }
-
-        subtype_per_major = pd.DataFrame({"major": pred_major, "sub": pred_sub}).groupby("major")["sub"].nunique()
-        metrics["min_subtypes_per_major"] = float(subtype_per_major.min())
-        metrics["max_subtypes_per_major"] = float(subtype_per_major.max())
-
-        if truth_major is not None and truth_sub is not None:
-            metrics["major_ari"] = float(adjusted_rand_score(truth_major, pred_major))
-            metrics["subtype_ari"] = float(adjusted_rand_score(truth_sub, pred_sub))
-
+        module_scores = self._collect_module_scores(self._zscore(x), root, gene_to_idx)
+        module_scores.index = adata.obs_names
+        max_assign_depth = self.config.pp_max_assign_depth if self.config.pp_enabled else None
+        cell_dict = self._assign_cells(x, root, gene_to_idx, max_depth=max_assign_depth)
         cell_assignments = pd.DataFrame(cell_dict, index=adata.obs_names)
-
-        if truth_major is not None and truth_sub is not None:
-            cell_assignments["true_depth1"] = truth_major
-            cell_assignments["true_depth2"] = truth_sub
-
-        return PipelineResult(
-            tree_root=tree_res.root,
-            preprocess=pre,
-            cell_assignments=cell_assignments,
-            module_scores=module_scores,
-            insertion_trace=pd.DataFrame(tree_res.insertion_trace),
-            metrics=metrics,
-            inserted_genes=tree_res.inserted_genes,
-            noise_genes=tree_res.noise_genes,
-        )
+        metrics = {
+            "n_valid_genes": float(pre.valid_gene_mask.sum()),
+            "n_inserted_genes": float(len(inserted)),
+            "n_noise_genes": float(len(noise)),
+            "n_major_pred": float(cell_assignments["depth1"].nunique()) if "depth1" in cell_dict else 0.0,
+        }
+        for key, depth, label in [(major_key, "depth1", "major"), (subtype_key, "depth2", "subtype")]:
+            if key is not None and depth in cell_dict:
+                truth = adata.obs[key].astype(str)
+                metrics[f"{label}_ari"] = float(adjusted_rand_score(truth, cell_dict[depth]))
+                cell_assignments[f"true_{depth}"] = truth
+        return PipelineResult(root, pre, cell_assignments, module_scores, trace, metrics, inserted, noise)

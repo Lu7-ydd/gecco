@@ -1,13 +1,18 @@
 from __future__ import annotations
 
 import textwrap
+from functools import wraps
 from pathlib import Path
 
 import matplotlib.pyplot as plt
 import numpy as np
+from matplotlib import font_manager
 from matplotlib.patches import Patch, Rectangle
+from scipy import sparse
 
 from .tree import ModuleNode
+from .relationships import binarize_expression
+from .utils import select_module_genes
 
 
 def _iter_nodes_with_depth(root: ModuleNode):
@@ -52,25 +57,37 @@ def _layout_tree(root: ModuleNode) -> tuple[dict[str, tuple[float, float]], dict
     return pos, depth_map, edges
 
 
-def _build_display_ids(root: ModuleNode) -> dict[str, str]:
-    display: dict[str, str] = {root.node_id: "root"}
+def _with_arial(plot):
+    """Resolve Arial explicitly, then preserve it in all rendered/exported text."""
+    @wraps(plot)
+    def wrapped(*args, **kwargs):
+        try:
+            font_manager.findfont("Arial", fallback_to_default=False)
+        except ValueError:
+            for path in font_manager.findSystemFonts():
+                if Path(path).name.lower().startswith("arial"):
+                    font_manager.fontManager.addfont(path)
+            font_manager.findfont("Arial", fallback_to_default=False)
+        families = ["Arial"]
+        if any(f.name == "Arial Unicode MS" for f in font_manager.fontManager.ttflist):
+            families.append("Arial Unicode MS")
+        with plt.rc_context({"font.family": families, "pdf.fonttype": 42, "svg.fonttype": "path"}):
+            return plot(*args, **kwargs)
+    return wrapped
 
-    def assign(node: ModuleNode, label: str) -> None:
-        for idx, child in enumerate(node.children, start=1):
-            if label == "root":
-                child_label = f"M{idx}"
-            else:
-                child_label = f"{label}{idx}"
-            display[child.node_id] = child_label
-            assign(child, child_label)
 
-    assign(root, "root")
-    return display
+def _finish(fig, output_path, show):
+    if output_path is not None:
+        fig.savefig(output_path, dpi=260, bbox_inches="tight")
+    if show:
+        plt.show()
 
 
-def plot_module_tree(root: ModuleNode, output_path: str | Path | None = None) -> None:
+@_with_arial
+def plot_module_tree(
+    root: ModuleNode, output_path: str | Path | None = None, *, show: bool = True
+):
     pos, depth_map, edges = _layout_tree(root)
-    display_ids = _build_display_ids(root)
 
     nodes = list(_iter_nodes_with_depth(root))
     max_depth = max(depth_map.values()) if depth_map else 0
@@ -87,7 +104,7 @@ def plot_module_tree(root: ModuleNode, output_path: str | Path | None = None) ->
         x2, y2 = pos[dst]
         ax.plot([x1, x2], [y1, y2], color="#94a3b8", linewidth=1.8, alpha=0.9, zorder=1)
 
-    cmap = plt.cm.get_cmap("YlGnBu", max_depth + 1 if max_depth >= 0 else 1)
+    cmap = plt.get_cmap("YlGnBu", max_depth + 1)
 
     xs: list[float] = []
     ys: list[float] = []
@@ -107,8 +124,7 @@ def plot_module_tree(root: ModuleNode, output_path: str | Path | None = None) ->
     for node, depth in nodes:
         x, y = pos[node.node_id]
         n_genes = len(node.genes)
-        node_label = display_ids.get(node.node_id, node.node_id)
-        label = f"{node_label}\nN={n_genes}"
+        label = f"{node.node_id}\nN={n_genes}"
         ax.text(
             x,
             y,
@@ -123,11 +139,8 @@ def plot_module_tree(root: ModuleNode, output_path: str | Path | None = None) ->
     ax.set_title("Hierarchical Gene Module Tree", fontsize=14, weight="bold", color="#0f172a")
     ax.set_axis_off()
     
-    if output_path is not None:
-        fig.savefig(output_path, dpi=260, bbox_inches='tight')
-        print(f"图已保存至: {output_path}")
-    
-    plt.show()
+    _finish(fig, output_path, show)
+    return fig, ax
 
 
 def _wrap_genes(genes: list[str], width: int) -> list[str]:
@@ -138,6 +151,7 @@ def _wrap_genes(genes: list[str], width: int) -> list[str]:
     return lines if lines else ["-"]
 
 
+@_with_arial
 def plot_node_genes(
     root: ModuleNode,
     output_path: str | Path | None = None,
@@ -145,7 +159,8 @@ def plot_node_genes(
     gene_source: str = "direct",
     include_root: bool = True,
     wrap_width: int = 120,
-) -> None:
+    show: bool = True,
+):
     if gene_source not in {"direct", "total"}:
         raise ValueError("gene_source must be 'direct' or 'total'")
 
@@ -197,23 +212,178 @@ def plot_node_genes(
         indent = "  " * depth
         node_label = f"{indent}{row['node_id']}"
 
-        ax.text(0.01, y - 0.1, node_label, color="#0f172a", fontsize=10, family="monospace", va="top")
+        ax.text(0.01, y - 0.1, node_label, color="#0f172a", fontsize=10, va="top")
         ax.text(0.14, y - 0.1, str(row["depth"]), color="#334155", fontsize=10, va="top")
         ax.text(0.20, y - 0.1, str(row["n_genes"]), color="#334155", fontsize=10, va="top")
-        ax.text(0.28, y - 0.1, "\n".join(lines), color="#1e293b", fontsize=9, family="monospace", va="top")
+        ax.text(0.28, y - 0.1, "\n".join(lines), color="#1e293b", fontsize=9, va="top")
 
         y -= n_lines + 1.0
 
     ax.set_title("Node-to-Gene Membership", loc="left", fontsize=14, weight="bold", color="#0f172a", pad=12)
     
-    if output_path is not None:
-        fig.savefig(output_path, dpi=230, bbox_inches='tight')
-        print(f"图已保存至: {output_path}")
-    
-    plt.show()
+    _finish(fig, output_path, show)
+    return fig, ax
 
 
 def ensure_output_dir(path: str | Path) -> Path:
     out = Path(path)
     out.mkdir(parents=True, exist_ok=True)
     return out
+
+
+@_with_arial
+def plot_module_heatmap(
+    adata,
+    root: ModuleNode,
+    node_ids: list[str] | None = None,
+    output_path: str | Path | None = None,
+    *,
+    gene_source: str = "total",
+    groupby: str | list[str] | None = None,
+    cell_order: list[str] | None = None,
+    scale: str = "zscore",
+    zscore_limit: float | None = 3.0,
+    binarize_quantile: float | None = None,
+    show: bool = True,
+):
+    """Gene rows in tree order, cell columns in observed or explicitly supplied order.
+
+    ``groupby`` stably orders cells by one or more ``adata.obs`` columns; an
+    explicit ``cell_order`` (cell names, optionally a subset) takes precedence.
+    ``scale`` is ``zscore`` (per gene across plotted cells), ``raw`` (adata.X
+    as supplied), or ``binary`` (expression > 0 by default; an explicit
+    ``binarize_quantile`` uses quantiles computed across all input cells).
+    ``zscore_limit`` caps the color range, not expression values; use ``None``
+    for the full range. Colorbar arrows indicate values outside the range.
+    No clustering is applied, so the displayed pattern can be checked directly.
+    """
+    genes = select_module_genes(root, node_ids, gene_source=gene_source)
+    if not genes:
+        raise ValueError("The selected modules contain no genes")
+    group_cols = [groupby] if isinstance(groupby, str) else list(groupby or [])
+    if cell_order is None:
+        cell_order = adata.obs.sort_values(group_cols, kind="stable").index if group_cols else adata.obs_names
+    selected = adata[cell_order, genes]
+    x = selected.X.toarray() if sparse.issparse(selected.X) else np.asarray(selected.X)
+    x = x.astype(float)
+    if scale == "zscore":
+        std = x.std(axis=0)
+        std[std == 0] = 1
+        x = (x - x.mean(axis=0)) / std
+        limit = zscore_limit if zscore_limit is not None else max(float(np.abs(x).max()), 1e-12)
+        image_options = {"cmap": "RdBu_r", "vmin": -limit, "vmax": limit}
+        color_label = "Expression (gene z-score)"
+    elif scale == "binary":
+        source = adata[:, genes].X
+        source = source.toarray() if sparse.issparse(source) else np.asarray(source)
+        binary = binarize_expression(source, binarize_quantile)
+        x = binary[adata.obs_names.get_indexer(selected.obs_names)]
+        image_options = {"cmap": "Blues", "vmin": 0, "vmax": 1}
+        color_label = "Expression (binary)"
+    elif scale == "raw":
+        image_options = {"cmap": "viridis"}
+        color_label = "Expression (adata.X)"
+    else:
+        raise ValueError("scale must be 'zscore', 'raw', or 'binary'")
+
+    fig, ax = plt.subplots(figsize=(11, max(3, 1.5 + 0.28 * len(genes))), constrained_layout=True)
+    im = ax.imshow(x.T, aspect="auto", interpolation="nearest", **image_options)
+    owner = {g: node.node_id for node, _ in _iter_nodes_with_depth(root) for g in node.genes}
+    ax.set_yticks(range(len(genes)), [f"{g}  ({owner[g]})" for g in genes], fontsize=9)
+    row_modules = [owner[g] for g in genes]
+    for i in range(1, len(genes)):
+        if row_modules[i] != row_modules[i - 1]:
+            ax.axhline(i - 0.5, color="white", lw=1)
+    if group_cols:
+        labels = selected.obs[group_cols].astype(str).agg(" / ".join, axis=1).to_numpy()
+        starts = np.r_[0, np.flatnonzero(labels[1:] != labels[:-1]) + 1]
+        ends = np.r_[starts[1:], len(labels)]
+        centers = (starts + ends - 1) / 2
+        crowded = len(starts) > 10 or (len(starts) > 1 and np.diff(centers).min() < len(labels) * 0.04)
+        if crowded:
+            categories = list(dict.fromkeys(labels))
+            cmap = plt.get_cmap("tab20", len(categories))
+            colors = {label: cmap(i) for i, label in enumerate(categories)}
+            for start, end in zip(starts, ends):
+                ax.axvspan(start - 0.5, end - 0.5, ymin=-0.025, ymax=-0.005,
+                           color=colors[labels[start]], linewidth=0, clip_on=False)
+            ax.set_xticks([])
+            ax.legend(handles=[Patch(color=colors[label], label=label) for label in categories],
+                      loc="upper center", bbox_to_anchor=(0.5, -0.09), ncol=3,
+                      frameon=False, fontsize=9)
+        else:
+            ax.set_xticks(centers, labels[starts], rotation=45, ha="right")
+        for start in starts[1:]:
+            ax.axvline(start - 0.5, color="#64748b", lw=0.8)
+        ax.set_xlabel("Cells grouped by " + " / ".join(group_cols), labelpad=14 if crowded else 4)
+    else:
+        ax.set_xticks([])
+        ax.set_xlabel(f"Cells (n={len(cell_order)})")
+    ax.set_ylabel("Gene (module ID)")
+    ax.set_title("Selected gene modules")
+    extend = "neither"
+    if scale == "zscore":
+        lower, upper = bool(x.min() < -limit), bool(x.max() > limit)
+        extend = "both" if lower and upper else "min" if lower else "max" if upper else "neither"
+    fig.colorbar(im, ax=ax, label=color_label, shrink=0.75, extend=extend)
+    _finish(fig, output_path, show)
+    return fig, ax
+
+
+@_with_arial
+def plot_relationship_heatmap(
+    pre,
+    root: ModuleNode,
+    node_ids: list[str] | None = None,
+    output_path: str | Path | None = None,
+    *,
+    gene_source: str = "total",
+    show_gene_names: bool | None = None,
+    show: bool = True,
+):
+    """Plot the selected gene-gene matrix in tree order, without aggregation.
+
+    Up to 40 genes, ticks show gene names. Larger matrices use module labels
+    at block centers; every matrix entry still represents one gene pair.
+    ``show_gene_names`` overrides this automatic labeling.
+    """
+    genes = select_module_genes(root, node_ids, gene_source=gene_source)
+    if not genes:
+        raise ValueError("The selected modules contain no genes")
+    gene_index = {g: i for i, g in enumerate(pre.gene_names)}
+    indices = [gene_index[g] for g in genes]
+    values = pre.phi[np.ix_(indices, indices)].copy()
+    np.fill_diagonal(values, np.nan)
+    n_genes = len(genes)
+    owner = {g: node.node_id for node, _ in _iter_nodes_with_depth(root) for g in node.genes}
+    modules = np.array([owner[g] for g in genes])
+    starts = np.r_[0, np.flatnonzero(modules[1:] != modules[:-1]) + 1]
+    ends = np.r_[starts[1:], n_genes]
+    major = {g: child.node_id for child in root.children for g in child.total_genes()}
+
+    fig, ax = plt.subplots(
+        figsize=(max(5, min(10, 0.38 * n_genes)), max(4, min(9, 0.34 * n_genes))),
+        constrained_layout=True,
+    )
+    im = ax.imshow(values, cmap="RdBu_r", vmin=-1, vmax=1, interpolation="nearest")
+    for start in starts[1:]:
+        width = 1.4 if major.get(genes[start]) != major.get(genes[start - 1]) else 0.6
+        ax.axvline(start - 0.5, color="white", lw=width)
+        ax.axhline(start - 0.5, color="white", lw=width)
+    if show_gene_names is None:
+        show_gene_names = n_genes <= 40
+    if show_gene_names:
+        ax.set_xticks(range(n_genes), genes, rotation=90, fontsize=9)
+        ax.set_yticks(range(n_genes), genes, fontsize=9)
+        axis_label = f"Genes (n={n_genes})"
+    else:
+        centers = (starts + ends - 1) / 2
+        ax.set_xticks(centers, modules[starts], fontsize=10)
+        ax.set_yticks(centers, modules[starts], fontsize=10)
+        axis_label = f"Genes grouped by module (n={n_genes})"
+    ax.set_xlabel(axis_label)
+    ax.set_ylabel(axis_label)
+    ax.set_title("Gene-gene relationships in tree order")
+    fig.colorbar(im, ax=ax, label="Relationship", shrink=0.75)
+    _finish(fig, output_path, show)
+    return fig, ax

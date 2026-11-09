@@ -1,0 +1,10 @@
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.ipynb_checkpoints/
+.DS_Store
+
+# Local validation outputs; README figures live in docs/images/.
+/outputs/manual_ngn3/
+/outputs/manual_simulation/
+/outputs/validation/
